@@ -1,0 +1,567 @@
+================================================================================
+RBI INDUSTRY CLASSIFICATION PIPELINE — DETAILED PROJECT EXPLANATION
+(Interview prep document — written to be read end to end, from scratch)
+================================================================================
+
+
+SECTION 1 — WHAT THE PROJECT IS
+================================================================================
+
+The client is an NBFC (a non-bank lender). When a loan officer processes a loan,
+they write a free-text "Personal Discussion" (PD) note describing what the
+borrower does for a living — in their own words, full of typos, regional trade
+slang, and irrelevant details (CIBIL score, collateral, family members). This
+note NEVER states a formal industry code.
+
+The ask: take every loan's PD note (~15,000 loans) and automatically assign it
+to the correct category in the RBI's official Industry Classification list —
+without a human reading each one by hand.
+
+Each loan needed:
+  - One PRIMARY classification — the borrower's main, currently running business.
+  - One SECONDARY classification (only when it genuinely exists) — either the
+    applicant's second business, or (if the applicant has only one) a
+    co-applicant's separate business.
+
+The RBI classification file itself is a fixed, closed list: 7 Segments
+(Agriculture, Manufacturing, Services, Education, Financial Institution, Retail
+Trade <5Cr, Wholesale Trade) containing 100 specific Segment -> Industry ->
+Sub-Industry combinations. This list is a hard boundary — the system is never
+allowed to invent, rename, or approximate a category. If a loan describes no
+real business at all (pure salary, blank remarks), it gets a separate status,
+"No Business Identified" — never force-fit into a wrong category.
+
+
+SECTION 2 — STEP-BY-STEP: HOW THE PROJECT WAS BUILT, IN ORDER
+================================================================================
+
+STEP 0 — Scope the problem in plain language first.
+  Before any code, wrote a plain-English outline (PROJECT_OUTLINE.md) with no
+  tech detail — what the two input files were, the Golden Rule (never go
+  outside the RBI list), how Primary/Secondary get decided, and worked examples
+  on real sample loans. Got this signed off before writing a line of code.
+  WHY: ambiguous business logic (what counts as a "separate business"? does a
+  co-applicant's business count? what about a planned-but-not-running
+  business?) needs to be nailed down as rules BEFORE it's encoded in a prompt
+  or in code, or you end up debugging business logic and code bugs at the same
+  time.
+
+STEP 1 — Turn the RBI Excel file into a clean, canonical taxonomy.
+  Parsed `Final_RBI_Industry_Classification.xlsx` into a single source of truth
+  (`taxonomy.py`): every row gets a stable internal ID (T001-T100), independent
+  of its human-readable label. This was necessary because 27 of the 65 distinct
+  sub-industry LABELS are not unique — "Engineering" alone appears under four
+  different Segments (Manufacturing, Services, Retail, Wholesale), each meaning
+  something different. A system that asked the model to output a label string
+  could silently get the right word but the wrong category.
+
+STEP 2 — Build a package skeleton with a strict module boundary.
+  Installable Python package `rbi-industry-classifier` (console command
+  `rbi-classify`), with one file per responsibility and no circular imports:
+    taxonomy.py   — the 100-category source of truth, IDs, lookup, hashing
+    loans.py      — reads the input Excel, hashes the raw file bytes
+    definitions.py— (see Step 3) generates/loads auto-written category glossary
+    ollama.py     — Ollama Cloud backend client
+    bedrock.py    — AWS Bedrock backend client (added later, same interface)
+    selection.py  — parses and validates the model's JSON response
+    classify.py   — orchestration: prompt building, thread pool, checkpointing
+    report.py     — writes the final Excel output
+    s3_io.py      — the ONLY module that talks to S3 (gated so local runs never
+                    even import boto3)
+    cli.py        — command-line entry point
+
+STEP 3 — Generate a machine-written glossary for the 100 categories
+  (`definitions.py`).
+  Early testing showed the model confused near-identical categories (e.g. the
+  four "Engineering" entries). Rather than hand-writing 100 definitions, used
+  the LLM itself to generate them — but batched by AMBIGUITY GROUP, not by
+  segment: every category that shares a label with siblings (e.g. all four
+  "Engineering" rows) was sent to the model in ONE call, together, and asked to
+  write definitions that are mutually exclusive, each naming the specific
+  "discriminator" (the one observable fact that separates it from its
+  siblings — e.g. "makes the goods" vs "resells them" vs "sells to other
+  businesses in bulk"). Categories with already-unique labels were batched
+  separately, 8 at a time, with simpler single definitions.
+  WHY batched this way: defining "Engineering" four times in isolation just
+  produces four paraphrases of "engineering" — nothing useful. Writing the four
+  siblings against each other forces a real discriminating test into each
+  definition.
+  Output: `artifacts/definitions.json`, hand-editable, hash-locked to the
+  taxonomy version so a stale definitions file can never silently describe the
+  wrong IDs. These definitions get folded into the main classification prompt
+  as supporting context — advisory prose, never able to widen what IDs are
+  actually selectable (the JSON-Schema enum is what enforces that; see Step 5).
+
+STEP 4 — Connect to an LLM backend (Ollama Cloud first).
+  Built `ollama.py` as a thin client around Ollama Cloud's chat API, confirmed
+  it could be called reliably, handled auth via `OLLAMA_API_KEY` (and `_2`,
+  `_3` for multiple accounts/key rotation — see Section 3).
+
+STEP 5 — Design the classification prompt and enforce the Golden Rule
+  structurally, not just by instruction (`classify.py`).
+  This is the core of the system — see Section 4 below for the full prompt
+  design and the specific prompting techniques used.
+  Key engineering decision: the model NEVER outputs a free-text category label.
+  It must pick one ID from a JSON-Schema `enum` containing exactly the 100
+  valid IDs (+ a NONE sentinel). An out-of-scope answer becomes structurally
+  unrepresentable — not just "discouraged by the prompt." Code then resolves
+  the chosen ID back to the real Segment/Industry/Sub-Industry strings for the
+  output file.
+  Because the model doesn't reliably honor the requested JSON *shape* even
+  with a schema (see Section 3), `selection.py` parses defensively across
+  several observed response shapes, and — critically — independently
+  re-validates every returned ID against the real taxonomy before using it.
+  This validation step, not the schema itself, is what actually guarantees
+  nothing outside the RBI list can reach the output.
+
+STEP 6 — Run the 7 demo cases, review against hand-worked expected answers.
+  `demo_file.xlsx` (7 real loans) doubles as both the design testbed AND the
+  acceptance test suite (`tests/test_acceptance.py`) — with documented,
+  hand-reasoned expected Primary/Secondary answers for each, used to sanity
+  check every later change to the prompt or logic.
+
+STEP 7 — Make a long batch run reliable (checkpointing).
+  A full run across ~15,000 loans takes up to 16 hours, so it must survive
+  being stopped and restarted. Built an append-only JSONL checkpoint
+  (`runs/<label>.jsonl`), one line per completed loan, flushed immediately so
+  an interruption loses at most one in-flight loan. The checkpoint header
+  stores a hash of the input file and a hash of the taxonomy, and refuses to
+  resume if either has changed underneath it — so you can never silently
+  continue a run against a file that's been edited.
+
+STEP 8 — Add observability (live per-row logging).
+  Originally the only visibility into a running job was a periodic "X/Y done"
+  summary — per-row failures were invisible until someone manually grepped the
+  checkpoint file afterward. Reworked the worker pool to log one line per
+  completed loan in true completion order (id, resolved category or error,
+  latency), alongside the periodic rate/ETA summary. See Section 3 for why the
+  original pool implementation was misleading.
+
+STEP 9 — Deploy to AWS (S3 + EC2).
+  Added `s3_io.py`: input workbook, output workbook, and taxonomy workbook
+  sync as single files; the `artifacts/` folder (definitions.json,
+  few_shot_examples.json) syncs as a whole directory, once per command, into a
+  local temp dir — so the rest of the codebase never needs to know S3 exists.
+  PII discipline: any file downloaded from S3 is deleted in a `finally` block
+  immediately after use, success or failure. Every CLI flag (`--input`,
+  `--taxonomy`, `--out-dir`, etc.) got a matching `.env` fallback so a
+  deployment can run with zero command-line arguments.
+
+STEP 10 — Add AWS Bedrock as a second, switchable LLM backend.
+  Built `bedrock.py` mirroring `ollama.py`'s exact function signature
+  (`chat_json(...) -> (payload, meta)`), so `classify.py` needed ZERO
+  backend-specific branching — an `LLM_BACKEND` env var just picks which
+  client object gets constructed. Bedrock's structured-output mechanism
+  (forced tool-use via the Converse API) is genuinely different internally
+  from Ollama's `format` schema parameter, so this wasn't a thin reskin.
+
+STEP 11 — Dockerize and set up CI/CD.
+  `docker/Dockerfile` (Python 3.11-slim, non-root user, `aws` extra baked in),
+  `.dockerignore` keeping `.env` and all data files out of the build context.
+  GitHub Actions: a `test` job (lint + pytest) gates everything; only a push to
+  `main` that PASSES CI triggers a `build-and-push` job to Docker Hub. Had to
+  cross-compile for `linux/arm64` (the EC2 target) from GitHub's amd64 runners
+  using QEMU emulation.
+
+STEP 12 — First real EC2 run, model comparison, and scaling to the full file.
+  Deployed, hit and fixed three environment-specific bugs (Section 3), ran a
+  structured comparison of Ollama vs two Bedrock models against ground truth,
+  then processed the full ~15,000-loan file locally in 1,000-row batches
+  (fixing a hashing bug along the way — Section 3) until complete.
+
+
+SECTION 3 — PROBLEMS FACED AND HOW THEY WERE SOLVED
+================================================================================
+(In the order they were discovered; each is real, from the project log.)
+
+PROBLEM 1 — Ambiguous category labels.
+  27 of 65 sub-industry labels aren't unique across Segments (e.g.
+  "Engineering" exists under Manufacturing, Services, Retail, and Wholesale).
+  A model outputting free-text labels could get the right word for the wrong
+  category.
+  FIX: assign every taxonomy row a stable ID (T001-T100). The model selects an
+  ID from a JSON-Schema `enum`, never free text. Code resolves the ID back to
+  the human-readable Segment/Industry/Sub-Industry afterward.
+
+PROBLEM 2 — The model doesn't reliably honor the requested JSON shape.
+  The exact same schema got answered in different structures across different
+  calls — e.g. for `definitions.py`'s generation step, the model sometimes
+  returned `{"definitions": [{"id": ...}]}` as asked, sometimes
+  `{"categories": [{"code": ...}]}` with renamed keys, sometimes a dict keyed
+  directly by the IDs themselves.
+  FIX: `selection.py` / `_extract_items()` parses defensively across every
+  observed shape, AND every extracted ID is independently validated against
+  the real taxonomy before being trusted. The schema asks nicely; the
+  validation step is what actually enforces correctness.
+
+PROBLEM 3 — "Starved thinking": the model burns its whole token budget on
+  reasoning and returns empty content.
+  With `think: true` enabled, the model sometimes used its entire allotted
+  tokens on internal reasoning and returned nothing, with
+  `done_reason="length"`. This mattered because disabling thinking entirely
+  was measured to tank accuracy — 89%/67% (primary/secondary) with thinking on
+  vs 67%/44% with it off — so turning thinking off was never an acceptable
+  fix.
+  FIX: detect the specific pattern (empty content + long thinking trace +
+  done_reason="length") and retry ONCE with both `num_ctx` AND `num_predict`
+  raised together — raising only one just starves the model at a new, still
+  insufficient, ceiling. Even this wasn't always enough at scale (see
+  Problem 9's logging fix, which was partly built to catch cases like this).
+
+PROBLEM 4 — Multiple Ollama accounts with unknown, undocumented quota
+  behaviour.
+  FIX: support `OLLAMA_API_KEY`, `_2`, `_3` configured side by side, with
+  automatic rotation to the next key on a detected exhaustion signal.
+  Documented honestly as a REASONED GUESS (401/402/403, or a 429 that doesn't
+  mention "concurrent") because the only failure actually observed in practice
+  was the concurrent-request throttle — which correctly does NOT trigger
+  rotation, it just waits and retries the same key.
+
+PROBLEM 5 — A real import-order bug leaking a raw Python error.
+  When boto3 wasn't installed (local-only mode), a missing-dependency check
+  leaked a raw `ModuleNotFoundError` instead of a clean message, because
+  `botocore.exceptions` was being imported BEFORE the check for whether boto3
+  was even present.
+  FIX: reorder — check for boto3's presence first, only import its
+  exception types after confirming it exists.
+
+PROBLEM 6 — Bedrock's forced tool-use isn't actually honored.
+  First live Bedrock run: every single row failed with "model returned no
+  tool_use block (stop_reason='end_turn')". The API call succeeded, but the
+  model answered in plain text instead of invoking the forced `classify` tool,
+  despite `toolChoice` explicitly forcing it.
+  FIX: applied the same defensive-parsing philosophy already built for Ollama
+  — when no `tool_use` block comes back, extract the first balanced `{...}`
+  JSON object out of the plain-text answer using proper brace-counting (not a
+  naive first-`{`-to-last-`}` slice, which breaks on nested braces), and parse
+  that instead of failing the row.
+
+PROBLEM 7 — Docker's `.env` parser is stricter than the project's own.
+  `docker: invalid env file (.env): variable 'OLLAMA_API_KEY ' contains
+  whitespaces.` The project's own `.env` reader tolerated `KEY = value`
+  spacing and stripped quotes; Docker's `--env-file` parser does neither — a
+  space before `=` becomes part of the variable NAME, and quote characters
+  become part of the VALUE instead of being stripped (which would have
+  silently corrupted the API key even after just fixing the whitespace).
+  FIX: reformatted `.env` to strict `KEY=value`, no spaces, no quotes, with a
+  comment explaining why, to prevent recurrence.
+
+PROBLEM 8 — Container permission error writing the checkpoint file.
+  `PermissionError` writing to `runs/`. Root cause: the container's baked-in
+  non-root user (uid 1000) didn't own the host-mounted `runs/` directory —
+  made worse because Docker had auto-created that directory as `root` during
+  an earlier failed attempt.
+  FIX: `chown` the host directory to match, and run the container with
+  `-u "$(id -u):$(id -g)"` so the container's user matches the host's.
+
+PROBLEM 9 — No real-time visibility into failures during a long run.
+  The only output was a periodic "X/Y done" summary; per-row errors were
+  silently written to the checkpoint JSONL and only discoverable by manually
+  grepping it afterward (this is literally how Problem 6's Bedrock failure had
+  to be diagnosed the first time).
+  FIX: switched the worker pool from `pool.map()` to `pool.submit()` +
+  `as_completed()`. This mattered because `pool.map()` silently serializes the
+  DELIVERY of results back to submission order even though the underlying work
+  runs concurrently — so a live per-row print loop built on top of `map()`
+  would appear to "hang" on a slow early row while later rows had already
+  finished. `as_completed()` surfaces results in true completion order, so a
+  printed line per completed loan (id, resolved category or error, latency)
+  now shows real-time progress accurately.
+
+PROBLEM 10 — A `--limit`-dependent checkpoint hash bug when batching the full
+  run.
+  Running the full 15,047-loan file in 1,000-row batches (raising `--limit` by
+  1,000 each session against the same checkpoint) broke on the SECOND batch:
+  "full_local.jsonl was written against a different input_sha1" — even though
+  the underlying file hadn't changed at all.
+  ROOT CAUSE: `input_sha1` was computed by hashing only the rows actually
+  LOADED in a given run, which stops early once `--limit` is hit. So a
+  `--limit 1000` run and a `--limit 2000` run of the exact same unchanged file
+  produced two different hashes. The drift-check was correctly designed to
+  catch "the file changed under you" but it accidentally ALSO caught "you used
+  a different --limit," breaking the intended next-batch-by-raising-limit
+  workflow.
+  FIX: `loans.py` now hashes the WHOLE file's raw bytes once, independent of
+  `--limit`, decoupling "did the file change" from "how much of it did this
+  run process." Since this changed what a "matching" hash looks like, the
+  existing checkpoint's header line was patched in place to the new hash
+  format (keeping a `.bak` copy) instead of discarding the 986 loans already
+  classified. Verified clean with the full test suite and a manual check that
+  the patched checkpoint still read back correctly with all prior rows intact.
+
+PROBLEM 11 — S3 objects referenced by the code but not yet uploaded.
+  `failed to download .../taxonomy/... (404)`. Not a code bug — the taxonomy
+  workbook and input file simply hadn't been pushed to the expected S3 keys
+  yet.
+  FIX: `aws s3 cp` both files to their designated prefixes. Logged as a
+  reminder that "S3-transparency" in the code doesn't remove the operational
+  step of actually putting the files there once.
+
+PROBLEM 12 — No single model/backend was clearly "best."
+  Comparing local Ollama vs Bedrock Nemotron vs Bedrock GPT-OSS-20B against
+  the three documented ground-truth worked examples: Nemotron got 0/3 fully
+  correct (hallucinated an unrelated secondary business; misclassified food
+  manufacturing as a Service instead of Manufacturing). Local Ollama got 2/3
+  correct with one secondary slip. GPT-OSS-20B (after sourcing the EXACT model
+  ID, `openai.gpt-oss-20b-1:0`, from the Bedrock console rather than guessing
+  it) got 2/3 fully correct, but showed a new failure mode: including a
+  PLANNED (not-yet-running) activity as secondary, violating the prompt's own
+  explicit exclusion rule.
+  IMPORTANT CALIBRATION STEP: before concluding anything about relative model
+  quality, reran the SAME 20 loans on the SAME Ollama backend a second time
+  (fresh API calls, not cache) and found only 90% identical primary
+  classifications and 75% identical primary+secondary combined — i.e. the
+  model itself is noisy run-to-run. This meant raw cross-backend disagreement
+  percentages had to be read against that noise floor, not taken at face
+  value.
+  DECISION: didn't declare any backend "production-ready" outright — instead
+  recommended running larger samples and treating each new model as its own
+  discovery pass, the same discipline that had already found every bug above.
+
+THE RECURRING THEME ACROSS ALL OF THIS:
+  - Every real bug in this project was found by actually RUNNING the system in
+    its real environment, not by code review alone — the S3 import-order bug,
+    the .env parsing mismatch, the Bedrock tool-use failure, the
+    input_sha1/--limit coupling. Treating each new environment (Docker, EC2, a
+    new model) as its own discovery pass, rather than assuming code that
+    worked once keeps working everywhere, paid off repeatedly.
+  - Secrets discipline held throughout: `.env` was never committed, never
+    copied through S3 or a deployment bundle, never baked into the Docker
+    image — only its VALUES move, via IAM roles or a file created directly on
+    the target machine.
+  - The LLM is the least trustworthy layer in the whole system, by design and
+    by observation — every defensive-parsing and validation layer
+    (selection.py's ID validation, bedrock.py's JSON-extraction fallback, the
+    starved-thinking retry) exists because some model, at some point, didn't
+    do what it was asked to do.
+
+
+SECTION 4 — PROMPTING TECHNIQUES USED (with concrete examples from the actual
+            prompts in this project)
+================================================================================
+
+This project used several distinct, textbook prompting techniques layered
+together — not just "ask the model nicely." Below is each one, what it is,
+and exactly where it shows up in this codebase.
+
+1. ROLE / PERSONA PROMPTING
+   The system prompt opens by assigning the model a specific professional
+   role, not a generic assistant role:
+     "You classify Indian NBFC loan files into a fixed RBI industry taxonomy.
+     You read a credit officer's Personal Discussion (PD) write-up..."
+   WHY: grounds the model's register and vocabulary expectations immediately
+   (financial/credit domain, not generic text understanding).
+
+2. STRUCTURED / SCHEMA-CONSTRAINED OUTPUT (a.k.a. constrained decoding)
+   The model is never allowed to return free text. `build_schema()` in
+   classify.py builds a JSON-Schema object where `primary_category_id` and
+   `secondary_category_id` are restricted to an `enum` of exactly the 100
+   valid taxonomy IDs plus a NONE sentinel. This is passed as the `format`
+   parameter to Ollama (and as a forced tool-use schema to Bedrock).
+   WHY: makes "the model invents a category that doesn't exist" structurally
+   impossible at the schema level (though see technique #8 below — the schema
+   alone wasn't trusted blindly).
+
+3. EXPLICIT CHAIN-OF-THOUGHT VIA A NUMBERED PROCEDURE (procedural / step
+   decomposition prompting)
+   The system prompt doesn't just describe the desired end state — it walks
+   the model through an explicit, numbered internal procedure it must follow
+   on every loan:
+     STEP 1 — List every income activity (what / owner / status)
+     STEP 2 — Choose Primary (eligibility rules, tie-break order a->b->c->d)
+     STEP 3 — Choose Secondary (search order, then a separate exclusion list
+              that OVERRIDES step 3's own instruction to "look harder")
+     STEP 4 — Choose the category (decision tree: segment first, then row)
+     STEP 5 — Confidence and review flag
+   WHY: breaking "classify this loan" into five mechanically ordered
+   sub-decisions reduces the chance the model jumps straight to a plausible-
+   sounding answer without actually checking eligibility/exclusion rules
+   first. This is the single biggest lever on output quality in this project
+   (see the 89% vs 67% accuracy swing tied to thinking budget, Problem 3).
+
+4. FEW-SHOT PROMPTING WITH REAL, DIVERSE, HARD EXAMPLES
+   `assets/few_shot_examples.json`, loaded via `load_few_shot_messages()` and
+   injected as alternating user/assistant message pairs before the real loan
+   is sent. 12 real loans (deliberately NOT overlapping with the 7 loans used
+   as acceptance tests, so the test suite stays meaningful), each picked to
+   demonstrate a DIFFERENT hard case:
+     - a second genuine business correctly identified + an unrelated family
+       member's salary correctly ignored
+     - a co-applicant's business becoming Secondary even though its income
+       wasn't formally counted for loan eligibility
+     - four candidate activities for one applicant, where only one Secondary
+       slot exists and the tie-break (order of mention) must be applied
+     - a fully salaried applicant -> "No Business Identified"
+     - a business with no matching RBI category at all (crop cultivation) ->
+       Primary correctly falls through to the co-applicant instead
+     - retail vs wholesale genuinely unclear in the source text -> model must
+       default to Retail AND set needs_review=true, per policy
+   WHY few-shot (rather than more written rules): some decisions are easier to
+   transmit via a worked example than via another paragraph of prose — e.g.
+   the "which of two Secondary candidates wins" tie-break is shown by example,
+   not just stated.
+
+5. DOMAIN GLOSSARY / VOCABULARY GROUNDING (terminology injection)
+   The prompt includes an explicit glossary of Indian trade slang and
+   abbreviations the model will encounter in real PD notes: "app/appl" =
+   applicant, "TO/BTO" = turnover / bank turnover, "kirana/kariyana/maligai" =
+   grocery, "arhtiya/aadhat" = commission agent, "tabela" = cattle shed,
+   "bhatta" = brick kiln, etc.
+   WHY: the model's general-purpose training data under-represents these
+   regional/trade terms; without this grounding block, it would mis-parse or
+   ignore domain vocabulary that's load-bearing for the classification
+   decision.
+
+6. NEGATIVE CONSTRAINTS / EXCLUSION LISTS THAT OVERRIDE EARLIER INSTRUCTIONS
+   Step 3 of the prompt first instructs the model to search harder for a
+   second business ("Look for a second activity in EVERY write-up before
+   concluding there is none..."), then immediately follows with a hard
+   override: "Then apply these exclusions. They OVERRIDE the instruction to
+   look harder: finding a candidate does not make it eligible." — followed by
+   an explicit list (never a planned activity, never a stopped activity, never
+   another family member's activity, never a salary/wage/pension/gig income).
+   WHY: without the explicit override framing, models tend to over-apply the
+   "look harder" instruction and promote an excluded candidate anyway just
+   because it was dutifully found. Stating the precedence order in the prompt
+   itself (not assuming the model will infer it) measurably reduces that
+   failure mode.
+
+7. RETRIEVAL-AUGMENTED / CONTEXT-INJECTED GROUNDING OF THE ANSWER SPACE
+   The entire 100-row taxonomy (as IDs + Segment/Industry/Sub-Industry) is
+   injected directly into the system prompt as the "# TAXONOMY" section —
+   along with a second, separately engineered "# TELLING LOOK-ALIKE
+   CATEGORIES APART" block built from the auto-generated definitions
+   (Section 2, Step 3) for exactly the categories known to be ambiguous.
+   WHY: rather than relying on the model's pretrained notion of what
+   "Engineering" or "Trading Others" means, the valid answer space and its
+   disambiguating rules are supplied as live context every single call — a
+   closed-book task is turned into an open-book one.
+
+8. DEFENSE-IN-DEPTH / "DON'T TRUST THE MODEL'S OWN COMPLIANCE" (a meta-
+   technique, not a prompting technique per se, but directly informed the
+   prompt design)
+   Despite the schema constraint (#2) and explicit procedure (#3), the
+   model's output was NEVER trusted blindly: every returned ID is
+   independently re-validated against the live taxonomy before being used
+   (selection.py), and multiple observed response SHAPES are parsed
+   defensively rather than assuming schema compliance. The prompt was
+   engineered to maximize compliance, but correctness is enforced in code, not
+   assumed from the prompt.
+
+9. META-PROMPTING / CONTRASTIVE GENERATION (used to build definitions.py's
+   glossary, which then feeds back into technique #7)
+   A separate system prompt asked the model to GENERATE training material for
+   itself: "These {n} categories all share the SAME Sub-Industry label and
+   differ ONLY by Segment/Industry... your definitions MUST be mutually
+   exclusive... name the single observable test that separates THIS entry
+   from its siblings." Ambiguous categories were batched together so the
+   model had to write each definition AGAINST its siblings, not in isolation.
+   WHY: this is prompting used as a build-time tool, not just a runtime one —
+   using the LLM to manufacture better context for its own later runtime
+   calls, rather than hand-authoring 100 definitions.
+
+10. CALIBRATED CONFIDENCE / SELF-ASSESSMENT PROMPTING
+    The model is asked to self-report a confidence tier (High/Medium/Low) and
+    a boolean `needs_review` flag, with EXPLICIT, mechanical criteria for each
+    tier rather than "use your judgment" — e.g. "Medium: the activity is
+    clear, but the segment (retail vs wholesale...) had to be inferred rather
+    than read." and an explicit rule to always flag "No Business Identified"
+    rows for human review even when the model is fully confident in that
+    status.
+    WHY: turns a notoriously unreliable LLM behavior (self-reported
+    confidence) into something closer to a checklist the model applies, and
+    then routes the lowest-trust outputs to a human reviewer instead of
+    treating every output as equally reliable.
+
+NOTE ON TWO DRAFT VERSIONS OF THE PROMPT:
+  The repo actually contains two generations of the system prompt:
+  `assets/alt_system_prompt.md` was an earlier, more verbose, Markdown-
+  structured draft (numbered sections, a full retail-vs-wholesale decision
+  table, explicit JSON output schema spelled out in prose) that was later
+  rewritten as the leaner `SYSTEM_TEMPLATE` embedded directly in
+  classify.py — moving the output-shape enforcement out of prose and into the
+  actual JSON-Schema `enum` (technique #2), since the earlier version still
+  asked the model to copy exact strings by hand, which is more failure-prone
+  than selecting a constrained ID. `tools/compare_alt_prompt.py` exists
+  specifically to A/B test the two prompt versions against each other on real
+  loans — i.e. prompt design itself was iterated on and measured, not just
+  written once and trusted.
+
+
+SECTION 5 — PLAIN-ENGLISH SUMMARY FOR AN INTERVIEWER
+================================================================================
+
+"I built an end-to-end LLM pipeline that reads free-text loan underwriting
+notes from a real NBFC and classifies each one into a fixed, 100-category RBI
+industry taxonomy, handling multiple businesses per loan, co-applicant
+ownership, and planned-vs-running distinctions that the notes don't state
+explicitly. The hard engineering problem wasn't calling an LLM — it was making
+an inherently unreliable component (a model that doesn't always follow a
+schema, that sometimes burns its whole reasoning budget and returns nothing,
+that answers four different ways to the same question) produce output that is
+structurally GUARANTEED to never leave a fixed category list, through a
+combination of schema-constrained decoding, independent output validation,
+chain-of-thought-style procedural prompting, and curated few-shot examples —
+and then make a 16-hour, 15,000-row batch job over that unreliable component
+survive interruption, scale across two different cloud LLM backends, and
+deploy safely with a real NBFC's customer PII in the pipeline. Nearly every
+real bug I hit was only found by actually running the system in its target
+environment — Docker's stricter env-file parser, a container-permission
+mismatch on EC2, Bedrock silently ignoring forced tool-use, and a checkpoint
+hashing bug that only showed up when batching the full dataset — which shaped
+how I now think about testing: unit tests caught logic bugs, but every
+environment-integration bug only surfaced by running the real thing end to
+end."
+
+
+SECTION 6 — ATS-FRIENDLY RESUME BULLETS
+================================================================================
+
+(End-to-end ownership framing — pick 3-5 for a one-role resume entry)
+
+- Designed and built an LLM-based classification pipeline (Python) that maps
+  free-text loan underwriting notes to a 100-category RBI industry taxonomy at
+  scale (~15,000 records), replacing fully manual review; enforced output
+  correctness via JSON-Schema enum constraints and post-hoc validation against
+  the taxonomy, eliminating category hallucination.
+
+- Benchmarked and integrated multiple LLM backends (Ollama Cloud, AWS Bedrock
+  - Nemotron, GPT-OSS-20B) behind a single switchable interface, quantifying
+  model accuracy (89%/67% primary/secondary classification accuracy) and
+  run-to-run variance to drive a data-backed backend selection instead of
+  anecdotal comparison.
+
+- Built a fault-tolerant batch processing system with checkpoint/resume
+  support (JSONL, SHA1-guarded against silent data drift) to reliably run
+  16+ hour classification jobs across interrupted sessions, with zero data
+  loss on resume.
+
+- Deployed the pipeline to AWS (EC2 + S3 + IAM) with a Dockerized, non-root,
+  cross-architecture (amd64->arm64) build, and automated the release pipeline
+  via GitHub Actions CI/CD (test-gated Docker builds pushed to Docker Hub).
+
+- Implemented PII-safe data handling for a financial-services (NBFC) dataset:
+  no secrets committed to source control, in-memory-only credential flow via
+  IAM roles/host-level env files, and immediate deletion of downloaded
+  sensitive files post-processing.
+
+- Diagnosed and fixed production-only defects (Docker env-file parsing,
+  container filesystem permissions, LLM structured-output non-compliance, a
+  checkpoint-hashing bug caused by batched --limit runs) across a real
+  multi-environment deployment (local -> Docker -> EC2).
+
+Short single-line alternative (if only one bullet fits):
+  Built and deployed an LLM-powered document classification pipeline (Python,
+  AWS Bedrock/Ollama, Docker, CI/CD) that automated industry classification
+  for ~15,000 loan records, with schema-enforced output validation,
+  checkpointed batch processing, and multi-backend model benchmarking.
+
+Skills / keywords for the skills section:
+  Python, LLM Integration, Prompt Engineering, AWS (Bedrock, EC2, S3, IAM),
+  Docker, GitHub Actions / CI-CD, JSON Schema, pytest, Structured Output
+  Validation, Concurrent Programming (ThreadPool/ProcessPool), Data Pipeline
+  Design.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
